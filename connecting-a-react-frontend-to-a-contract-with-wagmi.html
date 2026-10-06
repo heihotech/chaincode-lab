@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ChainCode Lab: Connecting a React frontend to a contract with wagmi</title>
+<style>
+body{margin:0;font-family:'Courier New',monospace;background:#fffef7;color:#111;line-height:1.75}
+.band{background:#111;color:#fde047;padding:18px 0}.c{max-width:680px;margin:0 auto;padding:0 18px}
+.brand{font-size:1.5rem;letter-spacing:-1px}.tl{color:#a3a3a3;font-size:.8rem}
+h1{font-size:1.9rem;border-bottom:4px solid #fde047;display:inline-block}
+h2{background:#111;color:#fde047;padding:2px 8px;display:inline-block}
+.ad-wrap{margin:26px 0;padding:10px;border:2px solid #111}
+a{color:#111;text-decoration:underline}pre{background:#111;color:#fde047;padding:12px;overflow:auto}
+.ft{border-top:2px dashed #111;margin-top:30px;padding:20px 0;font-size:.8rem}
+nav a{margin-right:14px}
+</style><script async src="https://www.googletagmanager.com/gtag/js?id=G-9VBXSW7347"></script><script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-9VBXSW7347");</script></head><body>
+<div class="band"><div class="c"><span class="brand">ChainCode Lab</span><div class="tl">Hands-on smart contract and Web3 tooling.</div></div></div>
+<div class="c"><nav><a href="connecting-a-react-frontend-to-a-contract-with-wagmi.html">Connecting a React frontend </a><a href="events-vs-storage-cheaper-ways-to-track-state.html">Events vs storage: cheaper w</a><a href="a-safe-pattern-for-contract-upgrades.html">A safe pattern for contract </a><a href="reading-on-chain-data-without-a-paid-node-provider.html">Reading on-chain data withou</a><a href="gas-optimization-tricks-that-actually-move-the-needle.html">Gas optimization tricks that</a></nav><h1>Connecting a React frontend to a contract with wagmi</h1><p>Once your contract is deployed, the next step is wiring up a frontend that can actually talk to it. wagmi is the go-to library for this in the React ecosystem — it handles wallet connections, chain switching, and contract reads/writes with a clean hooks API. This guide walks you through a minimal but complete setup, from installing dependencies to reading state and sending transactions.</p>
+
+<h2>Project Setup</h2>
+
+<p>Start with a fresh Vite + React project, then install what you need:</p>
+
+<pre><code>npm create vite@latest my-dapp -- --template react
+cd my-dapp
+npm install wagmi viem @tanstack/react-query</code></pre>
+
+<p>wagmi v2 uses <strong>viem</strong> as its transport and encoding layer (replacing ethers.js), and it requires <strong>React Query</strong> for async state management. These aren't optional — they're core to how wagmi works internally.</p>
+
+<h2>Configuring wagmi</h2>
+
+<p>Create a <code>wagmi.ts</code> config file at the root of your <code>src</code> folder:</p>
+
+<pre><code>// src/wagmi.ts
+import { createConfig, http } from 'wagmi'
+import { mainnet, sepolia } from 'wagmi/chains'
+import { injected, metaMask } from 'wagmi/connectors'
+
+export const config = createConfig({
+  chains: [mainnet, sepolia],
+  connectors: [injected(), metaMask()],
+  transports: {
+    [mainnet.id]: http(),
+    [sepolia.id]: http(),
+  },
+})</code></pre>
+
+<p>Then wrap your app in the required providers inside <code>main.tsx</code>:</p>
+
+<pre><code>// src/main.tsx
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { WagmiProvider } from 'wagmi'
+import { config } from './wagmi'
+import App from './App'
+
+const queryClient = new QueryClient()
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  &lt;WagmiProvider config={config}&gt;
+    &lt;QueryClientProvider client={queryClient}&gt;
+      &lt;App /&gt;
+    &lt;/QueryClientProvider&gt;
+  &lt;/WagmiProvider&gt;
+)</code></pre>
+
+<h2>Connecting a Wallet</h2>
+
+<p>wagmi exposes <code>useConnect</code>, <code>useDisconnect</code>, and <code>useAccount</code> for wallet state. Here's a minimal connect button:</p>
+
+<pre><code>import { useAccount, useConnect, useDisconnect } from 'wagmi'
+
+export function ConnectButton() {
+  const { address, isConnected } = useAccount()
+  const { connectors, connect } = useConnect()
+  const { disconnect } = useDisconnect()
+
+  if (isConnected) {
+    return (
+      &lt;div&gt;
+        &lt;p&gt;Connected: {address}&lt;/p&gt;
+        &lt;button onClick={() =&gt; disconnect()}&gt;Disconnect&lt;/button&gt;
+      &lt;/div&gt;
+    )
+  }
+
+  return (
+    &lt;div&gt;
+      {connectors.map((connector) =&gt; (
+        &lt;button key={connector.id} onClick={() =&gt; connect({ connector })}&gt;
+          Connect with {connector.name}
+        &lt;/button&gt;
+      ))}
+    &lt;/div&gt;
+  )
+}</code></pre>
+
+<p>The <code>connectors</code> array reflects whatever you passed into <code>createConfig</code>, so the UI adapts automatically when you add more wallet options later.</p>
+
+<h2>Reading Contract State</h2>
+
+<p>Assume you have a simple counter contract deployed on Sepolia:</p>
+
+<pre><code>// Counter.sol
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract Counter {
+    uint256 public count;
+
+    function increment() external {
+        count++;
+    }
+}</code></pre>
+
+<p>Use <code>useReadContract</code> to fetch the current count:</p>
+
+<pre><code>import { useReadContract } from 'wagmi'
+
+const CONTRACT_ADDRESS = '0xYourDeployedAddress'
+
+const abi = [
+  {
+    name: 'count',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'uint256' }],
+  },
+] as const
+
+export function CounterDisplay() {
+  const { data, isLoading, error } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi,
+    functionName: 'count',
+  })
+
+  if (isLoading) return &lt;p&gt;Loading...&lt;/p&gt;
+  if (error) return &lt;p&gt;Error: {error.message}&lt;/p&gt;
+
+  return &lt;p&gt;Current count: {data?.toString()}&lt;/p&gt;
+}</code></pre>
+
+<p>The <code>as const</code> assertion is important — it lets TypeScript infer the exact return type from the ABI, so <code>data</code> is typed as <code>bigint</code> rather than <code>unknown</code>.</p>
+
+<h2>Writing to the Contract</h2>
+
+<p>Sending a transaction uses <code>useWriteContract</code>. Pair it with <code>useWaitForTransactionReceipt</code> to track confirmation:</p>
+
+<pre><code>import { useWriteContract, useWaitForTransactionReceipt } from 'wagmi'
+
+export function IncrementButton() {
+  const { writeContract, data: txHash, isPending } = useWriteContract()
+
+  const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({
+    hash: txHash,
+  })
+
+  function handleIncrement() {
+    writeContract({
+      address: CONTRACT_ADDRESS,
+      abi,
+      functionName: 'increment',
+    })
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;button onClick={handleIncrement} disabled={isPending || isConfirming}&gt;
+        {isPending ? 'Awaiting wallet...' : isConfirming ? 'Confirming...' : 'Increment'}
+      &lt;/button&gt;
+      {isSuccess &amp;&amp; &lt;p&gt;Transaction confirmed!&lt;/p&gt;}
+    &lt;/div&gt;
+  )
+}</code></pre>
+
+<h2>A Few Practical Notes</h2>
+
+<ul>
+  <li><strong>ABI management:</strong> In a real project, export your ABI from a generated file (Hardhat or Foundry both support this) rather than hand-writing it inline.</li>
+  <li><strong>Chain mismatch:</strong> Use <code>useSwitchChain</code> to prompt users to switch networks if they're on the wrong one before sending a transaction.</li>
+  <li><strong>Invalidating reads after writes:</strong> wagmi's React Query integration means you can call <code>queryClient.invalidateQueries</code> after a confirmed transaction to refetch contract state automatically.</li>
+  <li><strong>Error handling:</strong> viem throws typed errors (e.g., <code>UserRejectedRequestError</code>), so you can catch and display meaningful messages rather than raw strings.</li>
+</ul>
+
+<h2>Putting It Together</h2>
+
+<p>The full flow is: configure chains and connectors once in <code>wagmi.ts</code>, wrap your app in providers, then use purpose-built hooks wherever you need wallet info, contract reads, or writes. Each piece is isolated — your connect button doesn't need to know about your contract, and your contract components don't need to manage wallet state directly.</p>
+
+<p>From here, you can layer in features like ENS resolution with <code>useEnsName</code>, watching contract events with <code>useWatchContractEvent</code>, or multi-call batching with <code>useReadContracts</code>. The hooks API stays consistent regardless of what you're doing, which makes wagmi genuinely pleasant to build with once you've got the initial wiring in place.</p>
+<div class="ad-wrap"><ins style="width: 0px;height:0px" data-width="0" data-height="0" class="l28cfacb682" data-domain="//data527.click" data-affquery="/80bf04636f050fc4e325/28cfacb682/?placementName=default"><script src="//data527.click/js/responsive.js" async></script></ins>
+<script type="text/javascript" src="//data527.click/a25fdca16729aaaf6cc4/bc94ac2c10/?placementName=default"></script>
+<script type="text/javascript" src="//data527.click/98b31bdd544a9930f268/3ed8752de1/?placementName=default"></script>
+<script type="text/javascript" src="//cdn-server.live/4abb6c32e6a15ca69842/6b2e82eb84/?placementName=default"></script>
+</div>
+<div class="ft">ChainCode Lab — 2026</div></div>
+</body></html>

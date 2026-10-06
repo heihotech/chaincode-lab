@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ChainCode Lab: Events vs storage: cheaper ways to track state</title>
+<style>
+body{margin:0;font-family:'Courier New',monospace;background:#fffef7;color:#111;line-height:1.75}
+.band{background:#111;color:#fde047;padding:18px 0}.c{max-width:680px;margin:0 auto;padding:0 18px}
+.brand{font-size:1.5rem;letter-spacing:-1px}.tl{color:#a3a3a3;font-size:.8rem}
+h1{font-size:1.9rem;border-bottom:4px solid #fde047;display:inline-block}
+h2{background:#111;color:#fde047;padding:2px 8px;display:inline-block}
+.ad-wrap{margin:26px 0;padding:10px;border:2px solid #111}
+a{color:#111;text-decoration:underline}pre{background:#111;color:#fde047;padding:12px;overflow:auto}
+.ft{border-top:2px dashed #111;margin-top:30px;padding:20px 0;font-size:.8rem}
+nav a{margin-right:14px}
+</style><script async src="https://www.googletagmanager.com/gtag/js?id=G-9VBXSW7347"></script><script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-9VBXSW7347");</script></head><body>
+<div class="band"><div class="c"><span class="brand">ChainCode Lab</span><div class="tl">Hands-on smart contract and Web3 tooling.</div></div></div>
+<div class="c"><nav><a href="connecting-a-react-frontend-to-a-contract-with-wagmi.html">Connecting a React frontend </a><a href="events-vs-storage-cheaper-ways-to-track-state.html">Events vs storage: cheaper w</a><a href="a-safe-pattern-for-contract-upgrades.html">A safe pattern for contract </a><a href="reading-on-chain-data-without-a-paid-node-provider.html">Reading on-chain data withou</a><a href="gas-optimization-tricks-that-actually-move-the-needle.html">Gas optimization tricks that</a></nav><h1>Events vs storage: cheaper ways to track state</h1><p>Every byte you write to contract storage costs gas. <code>SSTORE</code> on a cold slot runs you 20,000 gas the first time and 2,900 on subsequent writes. Events, on the other hand, cost 375 base gas plus 8 gas per non-zero byte in the log data. That gap is enormous, and it shapes a pattern you'll see in well-optimized contracts: use storage only for data the contract itself needs to read on-chain, and push everything else into events for off-chain consumers.</p>
+
+<h2>What each mechanism actually does</h2>
+
+<p>Storage variables live in the contract's persistent state trie. Any function—including other contracts—can read them via <code>SLOAD</code>. Events are emitted via <code>LOG</code> opcodes and written into the transaction receipt. The EVM never reads them back; they exist purely for the outside world.</p>
+
+<p>That distinction drives the decision. If your contract needs to check a value during execution, it must be in storage. If only your frontend, indexer, or analytics pipeline needs it, an event is almost always the right call.</p>
+
+<h2>A concrete example: tracking deposit history</h2>
+
+<p>Imagine a simple vault. A naïve implementation might store every deposit in a mapping or array:</p>
+
+<pre><code>// Expensive approach
+mapping(address => uint256[]) public depositHistory;
+
+function deposit() external payable {
+    depositHistory[msg.sender].push(msg.value);
+}
+</code></pre>
+
+<p>Each <code>push</code> writes a new storage slot: 20,000 gas for the first deposit per user, plus pointer updates to the dynamic array. For a busy vault this balloons quickly.</p>
+
+<p>If your UI just wants to display a user's past deposits, you don't need that data on-chain. Replace the array with an event:</p>
+
+<pre><code>event Deposited(address indexed user, uint256 amount, uint256 timestamp);
+
+function deposit() external payable {
+    emit Deposited(msg.sender, msg.value, block.timestamp);
+}
+</code></pre>
+
+<p>The gas drop is dramatic. A cold <code>SSTORE</code> becomes a <code>LOG2</code> (two indexed topics). Your frontend queries deposits with <code>eth_getLogs</code> filtered by the <code>user</code> topic. An indexer like The Graph or a simple ethers.js listener reconstructs the full history off-chain.</p>
+
+<h2>Indexed vs non-indexed topics</h2>
+
+<p>Events let you mark up to three parameters as <code>indexed</code>. Indexed params are stored as Bloom-filter-searchable topics; non-indexed params go into the ABI-encoded data field. Use <code>indexed</code> for fields you'll filter on:</p>
+
+<pre><code>event Transfer(
+    address indexed from,   // filterable
+    address indexed to,     // filterable
+    uint256 amount          // in data blob, cheaper
+);
+</code></pre>
+
+<p>Indexed topics cost a little more than data bytes, so don't over-index. A good rule: index addresses and IDs you'll query by; leave large payloads (strings, byte arrays) in data.</p>
+
+<h2>When you genuinely need storage</h2>
+
+<p>Events are not a universal replacement. Keep things in storage when:</p>
+
+<ul>
+  <li>The contract logic reads the value (balances, allowances, access control roles).</li>
+  <li>You need atomic reads inside a transaction (e.g., reentrancy guards, price oracles).</li>
+  <li>Another contract calls a getter on your data.</li>
+</ul>
+
+<p>A token's balance mapping <em>must</em> be in storage because <code>transfer</code> reads and writes it in the same call. The <code>Transfer</code> event is emitted in addition, not instead.</p>
+
+<h2>Hybrid patterns worth knowing</h2>
+
+<h3>Sparse storage + events</h3>
+
+<p>Store only the minimal on-chain state and emit rich context as events. An NFT contract stores <code>ownerOf</code> but emits metadata-change events so marketplaces can update listings without any additional storage writes.</p>
+
+<h3>Event-sourced state reconstruction</h3>
+
+<p>Some protocols (early Uniswap analytics, many L2 bridges) store almost nothing on-chain. A trusted indexer replays all events from genesis to reconstruct current state. This works well when read latency is acceptable and you control the indexing layer.</p>
+
+<h3>Packing storage slots</h3>
+
+<p>When you do need storage, pack variables into 32-byte slots. Solidity does this automatically for consecutive small types:</p>
+
+<pre><code>// Fits in one slot (8 + 8 + 16 = 32 bytes)
+uint64 public lastUpdated;
+uint64 public counter;
+uint128 public accumulatedFees;
+</code></pre>
+
+<p>Combine packing with events and you can often cut storage writes by 50–70% on complex state machines.</p>
+
+<h2>Tooling to validate your choices</h2>
+
+<p>Don't guess—measure. Run <code>forge test --gas-report</code> to see per-function gas usage. Compare the storage-heavy version against the event-based version in the same test suite. You'll usually see a 5–10× difference in gas for write-heavy flows. Cast is handy for quick checks too:</p>
+
+<pre><code>cast estimate &lt;CONTRACT&gt; "deposit()" --value 1ether --rpc-url $RPC
+</code></pre>
+
+<p>Profile before optimizing, then profile again after. Gas costs can shift with compiler versions and optimizer runs, so keep the benchmarks in CI.</p>
+
+<h2>The bottom line</h2>
+
+<p>Ask yourself one question for each piece of state: does the contract need this value during execution? If yes, it goes in storage. If only off-chain consumers need it, emit an event. That single habit—applied consistently—can cut your contract's gas footprint significantly without touching business logic. Events are first-class data in the Ethereum ecosystem; treat them that way.</p>
+<div class="ad-wrap"><ins style="width: 0px;height:0px" data-width="0" data-height="0" class="l28cfacb682" data-domain="//data527.click" data-affquery="/80bf04636f050fc4e325/28cfacb682/?placementName=default"><script src="//data527.click/js/responsive.js" async></script></ins>
+<script type="text/javascript" src="//data527.click/a25fdca16729aaaf6cc4/bc94ac2c10/?placementName=default"></script>
+<script type="text/javascript" src="//data527.click/98b31bdd544a9930f268/3ed8752de1/?placementName=default"></script>
+<script type="text/javascript" src="//cdn-server.live/4abb6c32e6a15ca69842/6b2e82eb84/?placementName=default"></script>
+</div>
+<div class="ft">ChainCode Lab — 2026</div></div>
+</body></html>

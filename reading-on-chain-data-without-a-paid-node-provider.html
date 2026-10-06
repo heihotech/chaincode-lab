@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ChainCode Lab: Reading on-chain data without a paid node provider</title>
+<style>
+body{margin:0;font-family:'Courier New',monospace;background:#fffef7;color:#111;line-height:1.75}
+.band{background:#111;color:#fde047;padding:18px 0}.c{max-width:680px;margin:0 auto;padding:0 18px}
+.brand{font-size:1.5rem;letter-spacing:-1px}.tl{color:#a3a3a3;font-size:.8rem}
+h1{font-size:1.9rem;border-bottom:4px solid #fde047;display:inline-block}
+h2{background:#111;color:#fde047;padding:2px 8px;display:inline-block}
+.ad-wrap{margin:26px 0;padding:10px;border:2px solid #111}
+a{color:#111;text-decoration:underline}pre{background:#111;color:#fde047;padding:12px;overflow:auto}
+.ft{border-top:2px dashed #111;margin-top:30px;padding:20px 0;font-size:.8rem}
+nav a{margin-right:14px}
+</style><script async src="https://www.googletagmanager.com/gtag/js?id=G-9VBXSW7347"></script><script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-9VBXSW7347");</script></head><body>
+<div class="band"><div class="c"><span class="brand">ChainCode Lab</span><div class="tl">Hands-on smart contract and Web3 tooling.</div></div></div>
+<div class="c"><nav><a href="connecting-a-react-frontend-to-a-contract-with-wagmi.html">Connecting a React frontend </a><a href="events-vs-storage-cheaper-ways-to-track-state.html">Events vs storage: cheaper w</a><a href="a-safe-pattern-for-contract-upgrades.html">A safe pattern for contract </a><a href="reading-on-chain-data-without-a-paid-node-provider.html">Reading on-chain data withou</a><a href="gas-optimization-tricks-that-actually-move-the-needle.html">Gas optimization tricks that</a></nav><h1>Reading on-chain data without a paid node provider</h1><p>Most tutorials assume you already have an Alchemy or Infura key wired up. But for side projects, quick scripts, or situations where you simply don't want to hand over an email address, there are solid ways to query Ethereum and EVM-compatible chains without a paid — or even a registered — provider. Here's a practical rundown of what actually works in 2024.</p>
+
+<h2>Public RPC Endpoints</h2>
+
+<p>Every major EVM chain publishes at least one free, unauthenticated RPC endpoint. These are rate-limited and unsuitable for production traffic, but they're perfectly fine for one-off reads, local scripts, and learning projects.</p>
+
+<ul>
+  <li><strong>Ethereum mainnet:</strong> <code>https://cloudflare-eth.com</code> or <code>https://eth.llamarpc.com</code></li>
+  <li><strong>Arbitrum One:</strong> <code>https://arb1.arbitrum.io/rpc</code></li>
+  <li><strong>Optimism:</strong> <code>https://mainnet.optimism.io</code></li>
+  <li><strong>Polygon:</strong> <code>https://polygon-rpc.com</code></li>
+  <li><strong>Base:</strong> <code>https://mainnet.base.org</code></li>
+</ul>
+
+<p>Chainlist (<a href="https://chainlist.org">chainlist.org</a>) aggregates these for hundreds of networks and even benchmarks latency in real time. Always cross-check a few endpoints; some community RPCs go stale without notice.</p>
+
+<h2>Making Raw Calls With curl</h2>
+
+<p>You don't need any library to prove this works. The Ethereum JSON-RPC spec is just HTTP POST with a JSON body. Here's how to fetch the latest block number on mainnet:</p>
+
+<pre><code>curl https://eth.llamarpc.com \
+  -X POST \
+  -H "Content-Type: application/json" \
+  --data '{
+    "jsonrpc": "2.0",
+    "method": "eth_blockNumber",
+    "params": [],
+    "id": 1
+  }'
+</code></pre>
+
+<p>You'll get back something like <code>{"result":"0x13a4f2b",...}</code>. Convert that hex to decimal and you have the current block. Reading a specific storage slot, checking an ERC-20 balance, or calling any view function follows the same pattern — you're just changing the method and params.</p>
+
+<h2>Using ethers.js or viem Without an API Key</h2>
+
+<p>Plugging a public RPC into your existing tooling takes one line. With ethers v6:</p>
+
+<pre><code>import { JsonRpcProvider } from "ethers";
+
+const provider = new JsonRpcProvider("https://eth.llamarpc.com");
+
+const block = await provider.getBlockNumber();
+console.log("Current block:", block);
+
+// Read an ERC-20 balance
+const abi = ["function balanceOf(address) view returns (uint256)"];
+const usdc = new Contract("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", abi, provider);
+const balance = await usdc.balanceOf("0xYourAddressHere");
+console.log("USDC balance:", balance.toString());
+</code></pre>
+
+<p>With viem, the pattern is similar — you create a <code>publicClient</code> pointing at your chosen transport URL instead of using the named chain presets that default to their own infrastructure.</p>
+
+<h2>Running a Local Node (More Practical Than You Think)</h2>
+
+<p>If you need reliable reads without rate limits, running a light client locally has gotten much easier. Two options worth knowing:</p>
+
+<h3>Helios</h3>
+<p>Helios is a trust-minimized Ethereum light client written in Rust. It syncs in seconds using consensus layer checkpoints and exposes a local JSON-RPC on <code>127.0.0.1:8545</code>. You still need a beacon node URL (Cloudflare offers a free one), but you don't need a full archive node.</p>
+
+<pre><code># Install via cargo
+cargo install helios
+
+# Run against mainnet
+helios ethereum \
+  --consensus-rpc https://www.lightclientdata.org \
+  --execution-rpc https://eth.llamarpc.com \
+  --rpc-port 8545
+</code></pre>
+
+<p>Once it's running, point any provider at <code>http://localhost:8545</code> and you're reading chain state with cryptographic verification, not trust.</p>
+
+<h3>Geth in Light Mode</h3>
+<p>Geth's light sync mode downloads only block headers and fetches state proofs on demand. It's heavier than Helios but battle-tested:</p>
+
+<pre><code>geth --syncmode light --http --http.api eth,net,web3
+</code></pre>
+
+<p>Light mode requires connected full-node peers willing to serve proofs, which has historically been unreliable on mainnet. It's more dependable on testnets or if you control your own full node elsewhere.</p>
+
+<h2>Querying Indexed Data With The Graph</h2>
+
+<p>Raw RPC calls are great for current state, but historical queries ("show me all Transfer events for this token over the last 10,000 blocks") get expensive fast. The Graph lets you query pre-indexed subgraphs with GraphQL for free on its hosted service and decentralized network.</p>
+
+<pre><code>const query = `{
+  transfers(first: 5, orderBy: timestamp, orderDirection: desc) {
+    from
+    to
+    value
+    timestamp
+  }
+}`;
+
+const res = await fetch(
+  "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3",
+  {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  }
+);
+const data = await res.json();
+</code></pre>
+
+<p>No API key needed for most public subgraphs. You're querying someone else's indexed data, so verify it against raw RPC for anything security-sensitive.</p>
+
+<h2>When Public RPCs Break</h2>
+
+<p>Public endpoints will occasionally rate-limit or go down. A few practical mitigations:</p>
+
+<ul>
+  <li>Rotate through a list of endpoints and retry on failure.</li>
+  <li>Cache results aggressively — block time is ~12 seconds, so you rarely need fresher data than that.</li>
+  <li>Use viem's <code>fallback</code> transport, which handles endpoint rotation automatically.</li>
+  <li>For scripts that run infrequently, a free tier on Alchemy or QuickNode (no credit card for the basic plan) is often the pragmatic call.</li>
+</ul>
+
+<p>The point isn't to avoid node providers forever — it's to know you're not blocked without them. For prototyping, scripts, and read-only tooling, the public infrastructure is more than enough to get real work done.</p>
+<div class="ad-wrap"><ins style="width: 0px;height:0px" data-width="0" data-height="0" class="l28cfacb682" data-domain="//data527.click" data-affquery="/80bf04636f050fc4e325/28cfacb682/?placementName=default"><script src="//data527.click/js/responsive.js" async></script></ins>
+<script type="text/javascript" src="//data527.click/a25fdca16729aaaf6cc4/bc94ac2c10/?placementName=default"></script>
+<script type="text/javascript" src="//data527.click/98b31bdd544a9930f268/3ed8752de1/?placementName=default"></script>
+<script type="text/javascript" src="//cdn-server.live/4abb6c32e6a15ca69842/6b2e82eb84/?placementName=default"></script>
+</div>
+<div class="ft">ChainCode Lab — 2026</div></div>
+</body></html>

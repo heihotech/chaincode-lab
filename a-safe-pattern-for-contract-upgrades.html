@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ChainCode Lab: A safe pattern for contract upgrades</title>
+<style>
+body{margin:0;font-family:'Courier New',monospace;background:#fffef7;color:#111;line-height:1.75}
+.band{background:#111;color:#fde047;padding:18px 0}.c{max-width:680px;margin:0 auto;padding:0 18px}
+.brand{font-size:1.5rem;letter-spacing:-1px}.tl{color:#a3a3a3;font-size:.8rem}
+h1{font-size:1.9rem;border-bottom:4px solid #fde047;display:inline-block}
+h2{background:#111;color:#fde047;padding:2px 8px;display:inline-block}
+.ad-wrap{margin:26px 0;padding:10px;border:2px solid #111}
+a{color:#111;text-decoration:underline}pre{background:#111;color:#fde047;padding:12px;overflow:auto}
+.ft{border-top:2px dashed #111;margin-top:30px;padding:20px 0;font-size:.8rem}
+nav a{margin-right:14px}
+</style><script async src="https://www.googletagmanager.com/gtag/js?id=G-9VBXSW7347"></script><script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-9VBXSW7347");</script></head><body>
+<div class="band"><div class="c"><span class="brand">ChainCode Lab</span><div class="tl">Hands-on smart contract and Web3 tooling.</div></div></div>
+<div class="c"><nav><a href="connecting-a-react-frontend-to-a-contract-with-wagmi.html">Connecting a React frontend </a><a href="events-vs-storage-cheaper-ways-to-track-state.html">Events vs storage: cheaper w</a><a href="a-safe-pattern-for-contract-upgrades.html">A safe pattern for contract </a><a href="reading-on-chain-data-without-a-paid-node-provider.html">Reading on-chain data withou</a><a href="gas-optimization-tricks-that-actually-move-the-needle.html">Gas optimization tricks that</a></nav><h1>A safe pattern for contract upgrades</h1><p>Upgrading a deployed contract without bricking user funds is one of the trickier problems in Solidity development. The proxy pattern solves it, but proxies introduce their own failure modes: storage collisions, uninitialized implementations, and accidental <code>selfdestruct</code> calls. This article walks through the UUPS (Universal Upgradeable Proxy Standard) pattern, explains why it's safer than the older Transparent Proxy, and shows you exactly how to wire it up with OpenZeppelin v5.</p>
+
+<h2>Why Proxies Work</h2>
+
+<p>A proxy contract holds all the storage and ETH, but delegates every call to a separate implementation contract using <code>delegatecall</code>. Because <code>delegatecall</code> executes the implementation's code in the proxy's storage context, users always interact with one stable address while you swap the logic underneath.</p>
+
+<pre><code>// Simplified delegatecall mechanics
+fallback() external payable {
+    address impl = _getImplementation();
+    assembly {
+        calldatacopy(0, 0, calldatasize())
+        let result := delegatecall(gas(), impl, 0, calldatasize(), 0, 0)
+        returndatacopy(0, 0, returndatasize())
+        switch result
+        case 0 { revert(0, returndatasize()) }
+        default { return(0, returndatasize()) }
+    }
+}
+</code></pre>
+
+<h2>UUPS vs Transparent Proxy</h2>
+
+<p>The classic Transparent Proxy puts upgrade logic inside the proxy itself and uses admin checks to route calls. That means every single user transaction pays extra gas to perform the admin check. UUPS flips this: the upgrade function lives in the <em>implementation</em>, not the proxy. The proxy becomes a thin shell — cheaper to deploy and cheaper per call.</p>
+
+<p>The tradeoff is responsibility. If you deploy an implementation that removes the upgrade function, you're permanently locked. That's why a disciplined upgrade workflow matters more with UUPS than with Transparent Proxy.</p>
+
+<h2>Writing a UUPS-Compatible Contract</h2>
+
+<p>Install the OpenZeppelin contracts package first:</p>
+
+<pre><code>npm install @openzeppelin/contracts-upgradeable
+</code></pre>
+
+<p>Here's a minimal upgradeable token contract:</p>
+
+<pre><code>// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.22;
+
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+
+contract MyTokenV1 is
+    Initializable,
+    ERC20Upgradeable,
+    OwnableUpgradeable,
+    UUPSUpgradeable
+{
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address initialOwner) public initializer {
+        __ERC20_init("MyToken", "MTK");
+        __Ownable_init(initialOwner);
+        __UUPSUpgradeable_init();
+        _mint(initialOwner, 1_000_000 ether);
+    }
+
+    function _authorizeUpgrade(address newImplementation)
+        internal
+        override
+        onlyOwner
+    {}
+}
+</code></pre>
+
+<p>Three things to notice:</p>
+<ul>
+  <li><strong><code>_disableInitializers()</code> in the constructor</strong> — prevents anyone from calling <code>initialize</code> on the bare implementation contract and taking ownership before you deploy the proxy.</li>
+  <li><strong>No <code>constructor</code> logic</strong> — all setup goes in <code>initialize</code>, which runs exactly once through the proxy.</li>
+  <li><strong><code>_authorizeUpgrade</code></strong> — this is the gate. Only the owner can push a new implementation. Customize this to a multisig or timelock in production.</li>
+</ul>
+
+<h2>Deploying with Hardhat and OpenZeppelin Upgrades Plugin</h2>
+
+<pre><code>import { ethers, upgrades } from "hardhat";
+
+async function main() {
+  const MyTokenV1 = await ethers.getContractFactory("MyTokenV1");
+  const [deployer] = await ethers.getSigners();
+
+  const proxy = await upgrades.deployProxy(MyTokenV1, [deployer.address], {
+    kind: "uups",
+  });
+
+  await proxy.waitForDeployment();
+  console.log("Proxy deployed to:", await proxy.getAddress());
+}
+
+main();
+</code></pre>
+
+<p>The plugin handles deploying the implementation, deploying the ERC1967 proxy, and calling <code>initialize</code> atomically. It also writes a <code>.openzeppelin/</code> manifest file that tracks your deployment history — commit this to version control.</p>
+
+<h2>Performing a Safe Upgrade</h2>
+
+<p>When you're ready to ship <code>MyTokenV2</code>, the plugin validates storage layout compatibility before touching the chain:</p>
+
+<pre><code>const MyTokenV2 = await ethers.getContractFactory("MyTokenV2");
+const upgraded = await upgrades.upgradeProxy(PROXY_ADDRESS, MyTokenV2, {
+  kind: "uups",
+});
+</code></pre>
+
+<p>If <code>MyTokenV2</code> reorders existing storage slots, the plugin throws before broadcasting any transaction. This catches the most common upgrade foot-gun without requiring you to audit the layout manually.</p>
+
+<h3>Storage Layout Rules to Follow</h3>
+<ul>
+  <li>Never remove or reorder existing state variables between versions.</li>
+  <li>Only append new variables at the end of the contract.</li>
+  <li>If you use inheritance, the parent chain order must stay the same.</li>
+  <li>Use a storage gap in base contracts you control: <code>uint256[50] private __gap;</code> so future parents can add variables without shifting child storage.</li>
+</ul>
+
+<h2>Add a Timelock for Production</h2>
+
+<p>Handing <code>_authorizeUpgrade</code> to a plain EOA owner is fine for a testnet, but in production you want a delay between "upgrade proposed" and "upgrade executed." Wire <code>_authorizeUpgrade</code> to OpenZeppelin's <code>TimelockController</code> — a 48-hour delay gives users time to exit if they disagree with an incoming change. Combine that with a multisig (like Safe) as the timelock proposer and you've got a defensible upgrade process that doesn't rely on a single private key.</p>
+
+<h2>Quick Checklist Before Upgrading</h2>
+<ul>
+  <li>Run <code>upgrades.validateUpgrade</code> in CI against every PR that touches contract code.</li>
+  <li>Deploy the new implementation to a fork of mainnet and run your full test suite against the upgraded proxy.</li>
+  <li>Verify the new implementation on Etherscan before calling <code>upgradeProxy</code>.</li>
+  <li>Confirm the proxy's <code>owner</code> (or timelock) is the account executing the upgrade transaction.</li>
+  <li>Monitor events — <code>Upgraded(address indexed implementation)</code> is emitted by the ERC1967 proxy on every successful upgrade.</li>
+</ul>
+
+<p>Upgradeable contracts are a sharp tool. The UUPS pattern keeps the proxy lean, but it demands that every new implementation is vetted before it goes live. Automate the storage validation, enforce a timelock, and treat each upgrade like a deployment — because for your users, it effectively is one.</p>
+<div class="ad-wrap"><ins style="width: 0px;height:0px" data-width="0" data-height="0" class="l28cfacb682" data-domain="//data527.click" data-affquery="/80bf04636f050fc4e325/28cfacb682/?placementName=default"><script src="//data527.click/js/responsive.js" async></script></ins>
+<script type="text/javascript" src="//data527.click/a25fdca16729aaaf6cc4/bc94ac2c10/?placementName=default"></script>
+<script type="text/javascript" src="//data527.click/98b31bdd544a9930f268/3ed8752de1/?placementName=default"></script>
+<script type="text/javascript" src="//cdn-server.live/4abb6c32e6a15ca69842/6b2e82eb84/?placementName=default"></script>
+</div>
+<div class="ft">ChainCode Lab — 2026</div></div>
+</body></html>

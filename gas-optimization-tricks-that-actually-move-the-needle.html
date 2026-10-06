@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ChainCode Lab: Gas optimization tricks that actually move the needle</title>
+<style>
+body{margin:0;font-family:'Courier New',monospace;background:#fffef7;color:#111;line-height:1.75}
+.band{background:#111;color:#fde047;padding:18px 0}.c{max-width:680px;margin:0 auto;padding:0 18px}
+.brand{font-size:1.5rem;letter-spacing:-1px}.tl{color:#a3a3a3;font-size:.8rem}
+h1{font-size:1.9rem;border-bottom:4px solid #fde047;display:inline-block}
+h2{background:#111;color:#fde047;padding:2px 8px;display:inline-block}
+.ad-wrap{margin:26px 0;padding:10px;border:2px solid #111}
+a{color:#111;text-decoration:underline}pre{background:#111;color:#fde047;padding:12px;overflow:auto}
+.ft{border-top:2px dashed #111;margin-top:30px;padding:20px 0;font-size:.8rem}
+nav a{margin-right:14px}
+</style><script async src="https://www.googletagmanager.com/gtag/js?id=G-9VBXSW7347"></script><script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-9VBXSW7347");</script></head><body>
+<div class="band"><div class="c"><span class="brand">ChainCode Lab</span><div class="tl">Hands-on smart contract and Web3 tooling.</div></div></div>
+<div class="c"><nav><a href="connecting-a-react-frontend-to-a-contract-with-wagmi.html">Connecting a React frontend </a><a href="events-vs-storage-cheaper-ways-to-track-state.html">Events vs storage: cheaper w</a><a href="a-safe-pattern-for-contract-upgrades.html">A safe pattern for contract </a><a href="reading-on-chain-data-without-a-paid-node-provider.html">Reading on-chain data withou</a><a href="gas-optimization-tricks-that-actually-move-the-needle.html">Gas optimization tricks that</a></nav><h1>Gas optimization tricks that actually move the needle</h1><p>Most gas optimization advice online is either obvious or irrelevant—"use <code>uint256</code> instead of <code>uint8</code>" doesn't mean much until you understand <em>why</em> and <em>when</em>. After profiling dozens of contracts with Foundry's <code>--gas-report</code> and Hardhat Gas Reporter, these are the changes that consistently shave meaningful gas from real deployments.</p>
+
+<h2>Storage Is the Enemy</h2>
+
+<p>Cold <code>SLOAD</code> costs 2,100 gas. Warm <code>SLOAD</code> costs 100. Writing to a new storage slot (<code>SSTORE</code>) costs 22,100 gas. Every decision in a hot function should start with "how many storage operations am I doing?" If the answer is more than one per variable, you're leaking gas.</p>
+
+<h3>Cache Storage Variables in Memory</h3>
+
+<p>This is the single highest-yield change in most contracts. Read a storage variable once, work with the local copy, write back once at the end.</p>
+
+<pre><code>// Expensive: 3 SLOADs
+function bad() external {
+    require(balance[msg.sender] >= 100);
+    balance[msg.sender] -= 100;
+    emit Withdrawn(balance[msg.sender]);
+}
+
+// Cheap: 1 SLOAD, 1 SSTORE
+function good() external {
+    uint256 bal = balance[msg.sender]; // cache
+    require(bal >= 100);
+    bal -= 100;
+    balance[msg.sender] = bal;
+    emit Withdrawn(bal);
+}</code></pre>
+
+<h3>Pack Structs Tightly</h3>
+
+<p>The EVM stores storage in 32-byte slots. If you arrange struct fields so multiple values share a slot, you pay for fewer slots. Order matters—smaller types grouped together.</p>
+
+<pre><code>// 3 storage slots
+struct Wasteful {
+    uint256 amount;
+    bool active;
+    uint256 timestamp;
+}
+
+// 2 storage slots
+struct Packed {
+    uint256 amount;
+    uint96 timestamp; // fits with bool in one slot
+    bool active;
+}</code></pre>
+
+<h2>Calldata Over Memory for External Functions</h2>
+
+<p>For external functions that receive arrays or structs without modifying them, use <code>calldata</code> instead of <code>memory</code>. <code>memory</code> copies the data; <code>calldata</code> reads it in place.</p>
+
+<pre><code>// Copies array into memory: ~200+ extra gas per element
+function processMemory(uint256[] memory ids) external { ... }
+
+// Reads from calldata directly
+function processCalldata(uint256[] calldata ids) external { ... }</code></pre>
+
+<p>On a 50-element array, this difference compounds quickly. Profile it yourself with <code>forge test --gas-report</code> and you'll typically see 15–30% savings on the function call.</p>
+
+<h2>Short-Circuit with Custom Errors</h2>
+
+<p>Replacing <code>require(condition, "long string message")</code> with custom errors saves deployment gas (no string storage) and runtime gas (cheaper revert data).</p>
+
+<pre><code>// Old: stores the string, larger bytecode
+require(msg.sender == owner, "Caller is not the owner");
+
+// New: 4-byte selector, no string storage
+error Unauthorized(address caller);
+if (msg.sender != owner) revert Unauthorized(msg.sender);</code></pre>
+
+<p>This isn't just cleaner—on a contract with twenty access checks, the bytecode reduction matters for deployment cost too.</p>
+
+<h2>Unchecked Math Where Safe</h2>
+
+<p>Since Solidity 0.8.0, overflow checks are built in. They cost gas. When you can <em>prove</em> overflow is impossible—like decrementing a value you just checked is large enough—wrap the operation in <code>unchecked</code>.</p>
+
+<pre><code>function debit(uint256 amount) external {
+    uint256 bal = balance[msg.sender];
+    require(bal >= amount);
+    unchecked {
+        balance[msg.sender] = bal - amount; // safe: checked above
+    }
+}</code></pre>
+
+<p>Don't scatter <code>unchecked</code> everywhere. Use it surgically, and leave a comment explaining why overflow is impossible. Future auditors will thank you.</p>
+
+<h2>Mappings Beat Arrays for Lookups</h2>
+
+<p>If you're iterating an array to find an element, you're burning gas proportional to array length. A mapping lookup is O(1) and costs a single <code>SLOAD</code>. The pattern is to maintain both if you need enumeration, but use the mapping for existence checks and data access.</p>
+
+<pre><code>mapping(address => bool) public isWhitelisted;
+address[] public whitelistArray; // only for off-chain enumeration
+
+function addToWhitelist(address user) external onlyOwner {
+    isWhitelisted[user] = true;
+    whitelistArray.push(user);
+}
+
+// Fast: one SLOAD
+function checkAccess(address user) internal view {
+    require(isWhitelisted[user], "Not whitelisted");
+}</code></pre>
+
+<h2>Immutable and Constant Variables</h2>
+
+<p>Variables that never change after deployment shouldn't live in storage. <code>constant</code> embeds the value directly in bytecode. <code>immutable</code> is set in the constructor and also avoids storage reads at runtime.</p>
+
+<pre><code>contract Token {
+    uint256 public constant MAX_SUPPLY = 1_000_000e18; // PUSH opcode, no SLOAD
+    address public immutable treasury; // set once, read from bytecode
+
+    constructor(address _treasury) {
+        treasury = _treasury;
+    }
+}</code></pre>
+
+<p>Accessing <code>MAX_SUPPLY</code> or <code>treasury</code> costs roughly 3 gas instead of 2,100. Over many calls, this is material.</p>
+
+<h2>Measure Everything</h2>
+
+<p>None of this replaces profiling. Set up a Foundry gas snapshot baseline before refactoring:</p>
+
+<pre><code>forge snapshot
+# make changes
+forge snapshot --diff</code></pre>
+
+<p>The diff shows you exactly which functions improved and by how much. Optimization without measurement is guesswork. Write the test, run the snapshot, change one thing at a time, and let the numbers tell you what moved the needle.</p>
+<div class="ad-wrap"><ins style="width: 0px;height:0px" data-width="0" data-height="0" class="l28cfacb682" data-domain="//data527.click" data-affquery="/80bf04636f050fc4e325/28cfacb682/?placementName=default"><script src="//data527.click/js/responsive.js" async></script></ins>
+<script type="text/javascript" src="//data527.click/a25fdca16729aaaf6cc4/bc94ac2c10/?placementName=default"></script>
+<script type="text/javascript" src="//data527.click/98b31bdd544a9930f268/3ed8752de1/?placementName=default"></script>
+<script type="text/javascript" src="//cdn-server.live/4abb6c32e6a15ca69842/6b2e82eb84/?placementName=default"></script>
+</div>
+<div class="ft">ChainCode Lab — 2026</div></div>
+</body></html>
